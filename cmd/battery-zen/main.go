@@ -2,25 +2,28 @@ package main
 
 import (
 	"encoding/csv"
-	"flag"
 	"fmt"
 	"log"
 	"math"
 	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Prajwal-Prathiksh/battery-zen/internal/analytics"
 	"github.com/Prajwal-Prathiksh/battery-zen/internal/config"
+	"github.com/Prajwal-Prathiksh/battery-zen/internal/lifecycle"
 	"github.com/Prajwal-Prathiksh/battery-zen/internal/lock"
 	"github.com/Prajwal-Prathiksh/battery-zen/internal/logfile"
-	"github.com/Prajwal-Prathiksh/battery-zen/internal/sysfs"
+	"github.com/Prajwal-Prathiksh/battery-zen/internal/power"
 )
 
 func main() {
 	log.SetFlags(0)
 
 	if len(os.Args) == 1 {
-		usage()
+		tuiCmd()
 		return
 	}
 
@@ -51,77 +54,160 @@ func usage() {
 	os.Exit(2)
 }
 
-func loadPaths() (config.Config, string) {
+func resolvePaths() (config.Config, string, error) {
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("config: %v", err)
+		return cfg, "", err
 	}
-	logPath, err := config.XDGLogPath(cfg)
+	logPath, err := config.LogPath(cfg)
 	if err != nil {
-		log.Fatalf("paths: %v", err)
+		return cfg, "", err
 	}
 	if err := logfile.EnsureDir(logPath); err != nil {
-		log.Fatalf("mkdir: %v", err)
+		return cfg, "", err
+	}
+	return cfg, logPath, nil
+}
+
+func loadPaths() (config.Config, string) {
+	cfg, logPath, err := resolvePaths()
+	if err != nil {
+		log.Fatalf("paths: %v", err)
 	}
 	return cfg, logPath
 }
 
-func sampleOnce(cfg config.Config, logPath string) error {
-	w := &logfile.Writer{Path: logPath}
-	ac := sysfs.ACOnline()
-	pct, ok := sysfs.BatteryPercent()
-	if !ok {
-		return fmt.Errorf("battery percent not found")
+func sampleOnce(cfg config.Config, logPath string, provider power.Provider) (power.Reading, error) {
+	reading, err := provider.Read()
+	if err != nil {
+		return power.Reading{}, err
 	}
-	ts := config.Now(cfg).Format(time.RFC3339)
-	if err := w.AppendCSV(ts, ac, pct); err != nil {
-		return err
+	writer := &logfile.Writer{Path: logPath}
+	timestamp := config.Now(cfg).Format(time.RFC3339)
+	if err := writer.Append(timestamp, reading); err != nil {
+		return reading, err
 	}
 	// Trim if we exceeded threshold
-	lines, err := w.LineCount()
+	lines, err := writer.LineCount()
 	if err == nil && lines > (cfg.MaxLines+cfg.TrimBuffer+1) { // +1 header
-		if err := w.TrimToLast(cfg.MaxLines); err != nil {
-			return err
+		if err := writer.TrimToLast(cfg.MaxLines); err != nil {
+			return reading, err
 		}
 	}
-	return nil
+	return reading, nil
 }
 
 func sampleCmd() {
 	cfg, logPath := loadPaths()
-	if err := sampleOnce(cfg, logPath); err != nil {
+	if _, err := sampleOnce(cfg, logPath, power.New()); err != nil {
 		log.Fatalf("sample: %v", err)
 	}
 }
 
 func runCmd() {
 	cfg, logPath := loadPaths()
-	// Guard with pidfile so only one daemon runs
-	lockPath := cfg.LogDir + "/.battery-zen.pid"
-	pf := &lock.PIDFile{Path: lockPath}
-	ok, err := pf.Acquire()
+	closeLog, err := configureRunLogging(cfg)
+	if err != nil {
+		log.Fatalf("logging: %v", err)
+	}
+	defer closeLog()
+	// Guard with a platform lock so only one daemon runs
+	instance := lock.New(filepath.Join(cfg.LogDir, ".battery-zen.lock"))
+	ok, err := instance.Acquire()
 	if err != nil {
 		log.Fatalf("lock: %v", err)
 	}
 	if !ok {
-		log.Fatalf("another instance is running")
+		return
 	}
-	defer pf.Release()
+	defer instance.Release()
+	bootID, err := lifecycle.BootID()
+	if err != nil {
+		log.Printf("boot identity: %v", err)
+	}
+	monitor, err := lifecycle.Start()
+	if err != nil {
+		log.Printf("lifecycle monitor: %v", err)
+	}
+	if monitor != nil {
+		defer monitor.Close()
+	}
+	runSamplingLoop(cfg, logPath, power.New(), nil, monitor, bootID)
+}
 
-	interval := time.Duration(cfg.IntervalSecs) * time.Second
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	// Initial tick immediately
-	if err := sampleOnce(cfg, logPath); err != nil {
+func runSamplingLoop(cfg config.Config, logPath string, provider power.Provider, stop <-chan struct{}, monitor lifecycle.Monitor, bootID string) {
+	store := &lifecycle.Store{Path: filepath.Join(cfg.LogDir, "events.csv")}
+	reading, err := sampleOnce(cfg, logPath, provider)
+	if err != nil {
 		log.Printf("sample: %v", err)
+		reading = power.Reading{Percent: -1}
 	}
-
-	for range ticker.C {
-		if err := sampleOnce(cfg, logPath); err != nil {
-			log.Printf("sample: %v", err)
+	startupTime := config.Now(cfg)
+	existingRecords, err := lifecycle.Read(store.Path)
+	if err != nil {
+		log.Printf("lifecycle history: %v", err)
+	}
+	previousBootID := ""
+	for i := len(existingRecords) - 1; i >= 0; i-- {
+		if existingRecords[i].BootID != "" {
+			previousBootID = existingRecords[i].BootID
+			break
 		}
 	}
+	if lifecycle.BootChanged(previousBootID, bootID) {
+		if err := store.Append(lifecycle.Event{Kind: lifecycle.Restart, Time: startupTime}, bootID, reading); err != nil {
+			log.Printf("lifecycle restart: %v", err)
+		}
+	}
+	if err := store.Append(lifecycle.Event{Kind: lifecycle.Startup, Time: startupTime}, bootID, reading); err != nil {
+		log.Printf("lifecycle startup: %v", err)
+	}
+	var events <-chan lifecycle.Event
+	if monitor != nil {
+		events = monitor.Events()
+	}
+	timer := time.NewTimer(sampleInterval(cfg, reading))
+	defer timer.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case event := <-events:
+			eventReading, readErr := provider.Read()
+			if readErr != nil {
+				log.Printf("lifecycle battery reading: %v", readErr)
+				eventReading = reading
+			} else {
+				reading = eventReading
+			}
+			if strings.EqualFold(cfg.Timezone, "UTC") {
+				event.Time = event.Time.UTC()
+			}
+			if err := store.Append(event, bootID, eventReading); err != nil {
+				log.Printf("lifecycle %s: %v", event.Kind, err)
+			}
+			if event.Ack != nil {
+				close(event.Ack)
+			}
+		case <-timer.C:
+			reading, err = sampleOnce(cfg, logPath, provider)
+			if err != nil {
+				log.Printf("sample: %v", err)
+			}
+			timer.Reset(sampleInterval(cfg, reading))
+		}
+	}
+}
+
+func sampleInterval(cfg config.Config, reading power.Reading) time.Duration {
+	seconds := cfg.IntervalSecs
+	if reading.ACConnected && cfg.IntervalSecsOnAC > 0 {
+		seconds = cfg.IntervalSecsOnAC
+	}
+	if seconds <= 0 {
+		seconds = 60
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 func trimCmd() {
@@ -134,18 +220,37 @@ func trimCmd() {
 
 func statusCmd() {
 	cfg, logPath := loadPaths()
-	ac := sysfs.ACOnline()
-	pct, _ := sysfs.BatteryPercent()
-	fmt.Printf("ac_connected=%t battery_life=%d ts=%s file=%s\n",
-		ac, pct, config.Now(cfg).Format(time.RFC3339), logPath)
+	reading, err := power.New().Read()
+	if err != nil {
+		log.Fatalf("status: %v", err)
+	}
+	fmt.Printf("ac_connected=%t battery_life=%d state=%s remaining_capacity_mwh=%s full_charged_capacity_mwh=%s design_capacity_mwh=%s rate_mw=%s voltage_mv=%s cycle_count=%s ts=%s file=%s\n",
+		reading.ACConnected,
+		reading.Percent,
+		reading.State,
+		optionalUint32(reading.RemainingCapacityMWh),
+		optionalUint32(reading.FullChargedCapacityMWh),
+		optionalUint32(reading.DesignCapacityMWh),
+		optionalInt32(reading.RateMW),
+		optionalUint32(reading.VoltageMV),
+		optionalUint32(reading.CycleCount),
+		config.Now(cfg).Format(time.RFC3339),
+		logPath,
+	)
 }
 
-// optional flags example (not strictly needed):
-func init() {
-	if len(os.Args) > 1 && os.Args[1] == "run" {
-		fs := flag.NewFlagSet("run", flag.ExitOnError)
-		_ = fs // add overrides if you wish
+func optionalUint32(value *uint32) string {
+	if value == nil {
+		return ""
 	}
+	return strconv.FormatUint(uint64(*value), 10)
+}
+
+func optionalInt32(value *int32) string {
+	if value == nil {
+		return ""
+	}
+	return strconv.FormatInt(int64(*value), 10)
 }
 
 // readCSV reads the battery CSV file and parses it into Row structs

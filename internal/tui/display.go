@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/Prajwal-Prathiksh/battery-zen/internal/analytics"
+	"github.com/Prajwal-Prathiksh/battery-zen/internal/lifecycle"
 	"github.com/Prajwal-Prathiksh/battery-zen/internal/widgets"
 
 	"github.com/mum4k/termdash/cell"
@@ -71,6 +72,7 @@ func BuildStatusLines(info StatusInfo) []LineSpec {
 			appendLine(fmt.Sprintf("--    Time to Empty (0%%): %s", info.Estimate), 0, false)
 		}
 	}
+	appendLine(fmt.Sprintf("--    %s: %s", info.FullRangeLabel, info.FullRangeEstimate), 0, false)
 
 	// Spacer
 	appendLine("", 0, false)
@@ -112,7 +114,8 @@ func BuildStatusLines(info StatusInfo) []LineSpec {
 
 	// Last suspend/shutdown event details
 	if info.LastSuspendEvent != nil {
-		appendLine(fmt.Sprintf("--    Last suspend: %s - %s (lasted %s)",
+		appendLine(fmt.Sprintf("--    Last %s: %s - %s (lasted %s)",
+			info.LastSuspendEvent.Kind,
 			info.LastSuspendEvent.StartTime.Format("Jan 2 15:04"),
 			info.LastSuspendEvent.EndTime.Format("Jan 2 15:04"),
 			FormatDurationAuto(info.LastSuspendEvent.Duration)), 0, false)
@@ -146,7 +149,8 @@ func BuildStatusLines(info StatusInfo) []LineSpec {
 	appendLine("", 0, false)
 
 	// Paths & config
-	appendLine(fmt.Sprintf("  Log file: %s", info.LogPath), 0, false)
+	appendLine(fmt.Sprintf("  Telemetry file: %s", info.LogPath), 0, false)
+	appendLine(fmt.Sprintf("  Events file: %s", info.EventLogPath), 0, false)
 	appendLine(info.ConfigStr, 0, false)
 
 	return lines
@@ -173,14 +177,14 @@ type DailySOTData struct {
 }
 
 // CalculateWeeklySOTData calculates daily SOT for the past 7 days
-func CalculateWeeklySOTData(rows []analytics.Row, gapThresholdMinutes int) []DailySOTData {
+func CalculateWeeklySOTData(rows []analytics.Row, lifecycleRecords []lifecycle.Record) []DailySOTData {
 	now := time.Now()
 	var weekData []DailySOTData
 
 	// Calculate for the past 7 days (including today)
 	for i := 6; i >= 0; i-- {
 		date := now.AddDate(0, 0, -i)
-		sotResult := analytics.CalculateDailyScreenOnTime(rows, date, gapThresholdMinutes)
+		sotResult := analytics.CalculateDailyScreenOnTime(rows, lifecycleRecords, date)
 
 		weekData = append(weekData, DailySOTData{
 			Date:     date,
@@ -194,8 +198,8 @@ func CalculateWeeklySOTData(rows []analytics.Row, gapThresholdMinutes int) []Dai
 }
 
 // UpdateSOTBarChart updates the daily SOT bar chart with new data
-func UpdateSOTBarChart(barChart *widgets.SOTBarChart, rows []analytics.Row, gapThresholdMinutes int) error {
+func UpdateSOTBarChart(barChart *widgets.SOTBarChart, rows []analytics.Row, lifecycleRecords []lifecycle.Record) error {
 	// Simply call UpdateData on our custom widget
-	barChart.UpdateData(rows, gapThresholdMinutes)
+	barChart.UpdateData(rows, lifecycleRecords)
 	return nil
 }

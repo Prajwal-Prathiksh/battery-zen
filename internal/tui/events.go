@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"path/filepath"
 	"time"
 
 	"github.com/Prajwal-Prathiksh/battery-zen/internal/analytics"
 	"github.com/Prajwal-Prathiksh/battery-zen/internal/config"
+	"github.com/Prajwal-Prathiksh/battery-zen/internal/lifecycle"
 	"github.com/Prajwal-Prathiksh/battery-zen/internal/widgets"
 
 	"github.com/mum4k/termdash/cell"
@@ -31,6 +33,10 @@ func SetupDataRefresh(ctx context.Context, logPath string, uiParams *UIParams, c
 			textWidget.Write("Press q to quit, r to refresh\n")
 			return nil
 		}
+		lifecycleRecords, err := lifecycle.Read(filepath.Join(filepath.Dir(logPath), "events.csv"))
+		if err != nil {
+			return fmt.Errorf("reading lifecycle events: %v", err)
+		}
 
 		// Process chart data
 		series, err := ProcessChartData(rows)
@@ -48,11 +54,11 @@ func SetupDataRefresh(ctx context.Context, logPath string, uiParams *UIParams, c
 		UpdateChartTitleFromZoom(c, startTime, endTime)
 
 		// Generate and update status text
-		statusInfo := GenerateStatusInfo(rows, alpha, uiParams, logPath, cfg)
+		statusInfo := GenerateStatusInfo(rows, lifecycleRecords, alpha, uiParams, logPath, cfg)
 		UpdateStatusText(textWidget, statusInfo)
 
 		// Update SOT bar chart
-		if err := UpdateSOTBarChart(sotBarChart, rows, cfg.SuspendGapMinutes); err != nil {
+		if err := UpdateSOTBarChart(sotBarChart, rows, lifecycleRecords); err != nil {
 			return fmt.Errorf("updating SOT bar chart: %v", err)
 		}
 

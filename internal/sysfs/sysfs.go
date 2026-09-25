@@ -1,3 +1,5 @@
+//go:build linux
+
 package sysfs
 
 import (
@@ -45,6 +47,11 @@ func ACOnline() bool {
 		}
 	}
 	return false
+}
+
+func BatteryStatus() string {
+	status, _ := readFirst("/sys/class/power_supply/BAT*/status")
+	return status
 }
 
 func BatteryCycleCount() (int, bool) {

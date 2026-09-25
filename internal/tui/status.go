@@ -31,6 +31,8 @@ type StatusInfo struct {
 	Estimate          string
 	EstimateDuration  time.Duration
 	EstimateETA       time.Time
+	FullRangeLabel    string
+	FullRangeEstimate string
 	TotalSamples      int
 	ACSamples         int
 	BattSamples       int
@@ -39,6 +41,7 @@ type StatusInfo struct {
 	EndTime           string
 	ConfigStr         string
 	LogPath           string
+	EventLogPath      string
 	MaxChargePercent  int
 	CycleCount        int
 	HasCycleCount     bool

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Prajwal-Prathiksh/battery-zen/internal/analytics"
+	"github.com/Prajwal-Prathiksh/battery-zen/internal/lifecycle"
 
 	"github.com/mum4k/termdash/cell"
 	"github.com/mum4k/termdash/private/canvas"
@@ -80,14 +81,14 @@ func SOTBarColors(barColor, todayBarColor, textColor cell.Color) SOTBarChartOpti
 }
 
 // UpdateData updates the SOT data for the past 7 days
-func (bc *SOTBarChart) UpdateData(rows []analytics.Row, gapThresholdMinutes int) {
+func (bc *SOTBarChart) UpdateData(rows []analytics.Row, lifecycleRecords []lifecycle.Record) {
 	now := time.Now()
 	var weekData []SOTBarData
 
 	// Calculate for the past 7 days (including today)
 	for i := 6; i >= 0; i-- {
 		date := now.AddDate(0, 0, -i)
-		sotResult := analytics.CalculateDailyScreenOnTime(rows, date, gapThresholdMinutes)
+		sotResult := analytics.CalculateDailyScreenOnTime(rows, lifecycleRecords, date)
 
 		weekData = append(weekData, SOTBarData{
 			Date:        date,

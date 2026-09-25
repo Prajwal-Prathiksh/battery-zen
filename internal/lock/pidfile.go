@@ -1,3 +1,5 @@
+//go:build linux
+
 package lock
 
 import (
@@ -80,3 +82,7 @@ func (p *PIDFile) Acquire() (bool, error) {
 }
 
 func (p *PIDFile) Release() { _ = os.Remove(p.Path) }
+
+func newPlatformLock(path string) Instance {
+	return &PIDFile{Path: path}
+}

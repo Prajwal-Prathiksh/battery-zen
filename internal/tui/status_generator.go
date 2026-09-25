@@ -2,11 +2,14 @@ package tui
 
 import (
 	"fmt"
+	"math"
+	"path/filepath"
 	"time"
 
 	"github.com/Prajwal-Prathiksh/battery-zen/internal/analytics"
 	"github.com/Prajwal-Prathiksh/battery-zen/internal/config"
-	"github.com/Prajwal-Prathiksh/battery-zen/internal/sysfs"
+	"github.com/Prajwal-Prathiksh/battery-zen/internal/lifecycle"
+	"github.com/Prajwal-Prathiksh/battery-zen/internal/power"
 )
 
 // FindLastACTransition finds when the current AC status started
@@ -30,7 +33,7 @@ func FindLastACTransition(rows []analytics.Row) (time.Time, float64) {
 }
 
 // GenerateStatusInfo processes battery data to create status information (logic only)
-func GenerateStatusInfo(rows []analytics.Row, alpha float64, uiParams *UIParams, logPath string, cfg config.Config) StatusInfo {
+func GenerateStatusInfo(rows []analytics.Row, lifecycleRecords []lifecycle.Record, alpha float64, uiParams *UIParams, logPath string, cfg config.Config) StatusInfo {
 	latest := rows[len(rows)-1]
 
 	// Find when the current AC status started
@@ -46,11 +49,23 @@ func GenerateStatusInfo(rows []analytics.Row, alpha float64, uiParams *UIParams,
 	var rateLabel string
 	var estimateDuration time.Duration
 	var estimateETA time.Time
+	fullRangeEstimate := "—"
+	fullRangeLabel := "Projected full-battery runtime (100% → 0%)"
+	if currentACState {
+		fullRangeLabel = "Projected full charge time (0% → 100%)"
+	}
 
 	if len(contiguousSamples) >= 2 {
 		rate, estimateMins, conf, ok := analytics.CalculateRateAndEstimate(contiguousSamples, latest.Batt, alpha, cfg.MaxChargePercent)
 		confidence = conf
-		if ok {
+		validFullRangeRate := currentACState && rate > 1e-6 || !currentACState && rate < -1e-6
+		if ok && validFullRangeRate {
+			fullRangeMins := 100 / math.Abs(rate)
+			if !math.IsNaN(fullRangeMins) && !math.IsInf(fullRangeMins, 0) {
+				fullRangeEstimate = FormatDurationAuto(time.Duration(fullRangeMins * float64(time.Minute)).Round(time.Minute))
+			}
+		}
+		if ok && !math.IsNaN(estimateMins) && !math.IsInf(estimateMins, 0) && estimateMins >= 0 {
 			if currentACState {
 				rateLabel = "Charge Rate"
 			} else {
@@ -114,14 +129,19 @@ func GenerateStatusInfo(rows []analytics.Row, alpha float64, uiParams *UIParams,
 	}
 
 	// Get battery cycle count
-	cycleCount, hasCycleCount := sysfs.BatteryCycleCount()
+	cycleCount := 0
+	hasCycleCount := false
+	if reading, err := power.New().Read(); err == nil && reading.CycleCount != nil {
+		cycleCount = int(*reading.CycleCount)
+		hasCycleCount = true
+	}
 
 	// Calculate screen-on time and suspend events
-	screenOnTime := analytics.CalculateScreenOnTime(rows, cfg.SuspendGapMinutes)
+	screenOnTime := analytics.CalculateScreenOnTime(rows, lifecycleRecords)
 
 	// Calculate today's screen-on time
 	now := time.Now()
-	todayScreenOnTime := analytics.CalculateDailyScreenOnTime(rows, now, cfg.SuspendGapMinutes)
+	todayScreenOnTime := analytics.CalculateDailyScreenOnTime(rows, lifecycleRecords, now)
 
 	// Get the most recent suspend event
 	var lastSuspendEvent *analytics.SuspendEvent
@@ -139,6 +159,8 @@ func GenerateStatusInfo(rows []analytics.Row, alpha float64, uiParams *UIParams,
 		Estimate:          est,
 		EstimateDuration:  estimateDuration,
 		EstimateETA:       estimateETA,
+		FullRangeLabel:    fullRangeLabel,
+		FullRangeEstimate: fullRangeEstimate,
 		TotalSamples:      totalSamples,
 		ACSamples:         acSamples,
 		BattSamples:       battSamples,
@@ -147,6 +169,7 @@ func GenerateStatusInfo(rows []analytics.Row, alpha float64, uiParams *UIParams,
 		EndTime:           endTime,
 		ConfigStr:         configStr,
 		LogPath:           logPath,
+		EventLogPath:      filepath.Join(filepath.Dir(logPath), "events.csv"),
 		MaxChargePercent:  cfg.MaxChargePercent,
 		CycleCount:        cycleCount,
 		HasCycleCount:     hasCycleCount,

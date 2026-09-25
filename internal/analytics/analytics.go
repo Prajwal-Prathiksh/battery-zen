@@ -4,9 +4,12 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Prajwal-Prathiksh/battery-zen/internal/lifecycle"
 )
 
 // Row represents a single CSV record
@@ -246,8 +249,9 @@ func parseTimestamp(tsStr string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("unable to parse timestamp")
 }
 
-// SuspendEvent represents a detected suspend/shutdown period
+// SuspendEvent represents an observed suspend, shutdown, logoff, or restart period
 type SuspendEvent struct {
+	Kind          lifecycle.Kind
 	StartTime     time.Time
 	EndTime       time.Time
 	Duration      time.Duration
@@ -256,32 +260,72 @@ type SuspendEvent struct {
 	BatteryDrop   float64
 }
 
-// DetectSuspendEvents identifies periods where data logging was interrupted,
-// indicating system suspend or shutdown. Returns events in chronological order.
-func DetectSuspendEvents(rows []Row, gapThresholdMinutes int) []SuspendEvent {
-	if len(rows) < 2 {
-		return nil
-	}
-
+// DetectSuspendEvents pairs explicit lifecycle transitions into inactive periods.
+func DetectSuspendEvents(rows []Row, records []lifecycle.Record) []SuspendEvent {
+	ordered := append([]lifecycle.Record(nil), records...)
+	sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].Time.Before(ordered[j].Time) })
 	var events []SuspendEvent
-	threshold := time.Duration(gapThresholdMinutes) * time.Minute
-
-	for i := 1; i < len(rows); i++ {
-		gap := rows[i].T.Sub(rows[i-1].T)
-		if gap >= threshold {
-			event := SuspendEvent{
-				StartTime:     rows[i-1].T,
-				EndTime:       rows[i].T,
-				Duration:      gap,
-				BatteryBefore: rows[i-1].Batt,
-				BatteryAfter:  rows[i].Batt,
-				BatteryDrop:   rows[i-1].Batt - rows[i].Batt,
+	var inactive *lifecycle.Record
+	var lastBootID string
+	for i := range ordered {
+		record := ordered[i]
+		switch record.Kind {
+		case lifecycle.Suspend, lifecycle.Shutdown, lifecycle.Logoff:
+			if inactive == nil {
+				copy := record
+				inactive = &copy
+			} else if record.Kind == lifecycle.Shutdown {
+				inactive.Kind = lifecycle.Shutdown
 			}
-			events = append(events, event)
+		case lifecycle.Resume:
+			if inactive != nil {
+				events = append(events, lifecyclePeriod(*inactive, record))
+				inactive = nil
+			}
+		case lifecycle.Startup, lifecycle.Restart:
+			if inactive != nil {
+				events = append(events, lifecyclePeriod(*inactive, record))
+				inactive = nil
+			} else if lifecycle.BootChanged(lastBootID, record.BootID) {
+				if previous, ok := latestRowBefore(rows, record.Time); ok {
+					events = append(events, SuspendEvent{
+						Kind:          lifecycle.Restart,
+						StartTime:     previous.T,
+						EndTime:       record.Time,
+						Duration:      record.Time.Sub(previous.T),
+						BatteryBefore: previous.Batt,
+						BatteryAfter:  record.Battery,
+						BatteryDrop:   previous.Batt - record.Battery,
+					})
+				}
+			}
+			if record.BootID != "" {
+				lastBootID = record.BootID
+			}
 		}
 	}
-
 	return events
+}
+
+func lifecyclePeriod(start, end lifecycle.Record) SuspendEvent {
+	return SuspendEvent{
+		Kind:          start.Kind,
+		StartTime:     start.Time,
+		EndTime:       end.Time,
+		Duration:      end.Time.Sub(start.Time),
+		BatteryBefore: start.Battery,
+		BatteryAfter:  end.Battery,
+		BatteryDrop:   start.Battery - end.Battery,
+	}
+}
+
+func latestRowBefore(rows []Row, timestamp time.Time) (Row, bool) {
+	for i := len(rows) - 1; i >= 0; i-- {
+		if rows[i].T.Before(timestamp) {
+			return rows[i], true
+		}
+	}
+	return Row{}, false
 }
 
 // ScreenOnTimeResult holds screen-on time calculation results
@@ -292,59 +336,82 @@ type ScreenOnTimeResult struct {
 	SuspendEvents     []SuspendEvent // All suspend events in the period
 }
 
-// CalculateScreenOnTime calculates screen-on time by detecting gaps in data logging.
-// Active time = total time span - suspend time (gaps >= threshold).
-// This is a proxy for screen-on time since logging typically happens when system is active.
-func CalculateScreenOnTime(rows []Row, gapThresholdMinutes int) ScreenOnTimeResult {
-	result := ScreenOnTimeResult{}
-
+// CalculateScreenOnTime calculates active time from explicit lifecycle events.
+func CalculateScreenOnTime(rows []Row, records []lifecycle.Record) ScreenOnTimeResult {
 	if len(rows) < 2 {
-		return result
+		return ScreenOnTimeResult{}
 	}
-
-	// Detect all suspend events
-	result.SuspendEvents = DetectSuspendEvents(rows, gapThresholdMinutes)
-
-	// Calculate total suspend time
-	for _, event := range result.SuspendEvents {
-		result.SuspendTime += event.Duration
-	}
-
-	// Total time span
-	totalTimeSpan := rows[len(rows)-1].T.Sub(rows[0].T)
-
-	// Active time = total span - suspend time
-	result.TotalActiveTime = totalTimeSpan - result.SuspendTime
-
-	// Calculate time since last suspend/wake (current active session)
-	if len(result.SuspendEvents) > 0 {
-		lastSuspendEnd := result.SuspendEvents[len(result.SuspendEvents)-1].EndTime
-		result.LastActiveSession = rows[len(rows)-1].T.Sub(lastSuspendEnd)
-	} else {
-		// No suspends detected, entire period is one session
-		result.LastActiveSession = result.TotalActiveTime
-	}
-
-	return result
+	return calculateScreenOnTimeRange(rows, records, rows[0].T, rows[len(rows)-1].T)
 }
 
 // CalculateDailyScreenOnTime calculates screen-on time for a specific day.
-// Returns active time and suspend events for that day only.
-func CalculateDailyScreenOnTime(rows []Row, targetDate time.Time, gapThresholdMinutes int) ScreenOnTimeResult {
-	// Filter rows to only include the target date
-	startOfDay := time.Date(targetDate.Year(), targetDate.Month(), targetDate.Day(), 0, 0, 0, 0, targetDate.Location())
-	endOfDay := startOfDay.Add(24 * time.Hour)
-
-	var dayRows []Row
-	for _, row := range rows {
-		if row.T.After(startOfDay) && row.T.Before(endOfDay) {
-			dayRows = append(dayRows, row)
-		}
-	}
-
-	if len(dayRows) == 0 {
+func CalculateDailyScreenOnTime(rows []Row, records []lifecycle.Record, targetDate time.Time) ScreenOnTimeResult {
+	if len(rows) < 2 {
 		return ScreenOnTimeResult{}
 	}
+	startOfDay := time.Date(targetDate.Year(), targetDate.Month(), targetDate.Day(), 0, 0, 0, 0, targetDate.Location())
+	endOfDay := startOfDay.Add(24 * time.Hour)
+	start := startOfDay
+	if rows[0].T.After(start) {
+		start = rows[0].T
+	}
+	end := endOfDay
+	if rows[len(rows)-1].T.Before(end) {
+		end = rows[len(rows)-1].T
+	}
+	if !end.After(start) {
+		return ScreenOnTimeResult{}
+	}
+	return calculateScreenOnTimeRange(rows, records, start, end)
+}
 
-	return CalculateScreenOnTime(dayRows, gapThresholdMinutes)
+func calculateScreenOnTimeRange(rows []Row, records []lifecycle.Record, start, end time.Time) ScreenOnTimeResult {
+	result := ScreenOnTimeResult{SuspendEvents: DetectSuspendEvents(rows, records)}
+	for _, event := range result.SuspendEvents {
+		clippedStart := event.StartTime
+		if clippedStart.Before(start) {
+			clippedStart = start
+		}
+		clippedEnd := event.EndTime
+		if clippedEnd.After(end) {
+			clippedEnd = end
+		}
+		if clippedEnd.After(clippedStart) {
+			result.SuspendTime += clippedEnd.Sub(clippedStart)
+		}
+	}
+	result.TotalActiveTime = end.Sub(start) - result.SuspendTime
+	activeStart := start
+	inactive := false
+	lastBootID := ""
+	ordered := append([]lifecycle.Record(nil), records...)
+	sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].Time.Before(ordered[j].Time) })
+	for _, record := range ordered {
+		if record.Time.After(end) {
+			break
+		}
+		beforeRange := record.Time.Before(start)
+		switch record.Kind {
+		case lifecycle.Resume:
+			if !beforeRange {
+				activeStart = record.Time
+			}
+			inactive = false
+		case lifecycle.Startup, lifecycle.Restart:
+			bootChanged := lifecycle.BootChanged(lastBootID, record.BootID)
+			if !beforeRange && (inactive || bootChanged || lastBootID == "") {
+				activeStart = record.Time
+			}
+			inactive = false
+			if record.BootID != "" {
+				lastBootID = record.BootID
+			}
+		case lifecycle.Suspend, lifecycle.Shutdown, lifecycle.Logoff:
+			inactive = true
+		}
+	}
+	if !inactive && end.After(activeStart) {
+		result.LastActiveSession = end.Sub(activeStart)
+	}
+	return result
 }

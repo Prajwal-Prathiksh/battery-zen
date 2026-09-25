@@ -11,51 +11,42 @@ import (
 )
 
 type Config struct {
-	IntervalSecs      int    `toml:"interval_secs"`
-	IntervalSecsOnAC  int    `toml:"interval_secs_on_ac"`
-	Timezone          string `toml:"timezone"` // "UTC" or "Local"
-	LogDir            string `toml:"log_dir"`
-	LogFile           string `toml:"log_file"`
-	MaxLines          int    `toml:"max_lines"`
-	TrimBuffer        int    `toml:"trim_buffer"`
-	MaxChargePercent  int    `toml:"max_charge_percent"`
-	DayColorNumber    int    `toml:"day_color_number"`
-	NightColorNumber  int    `toml:"night_color_number"`
-	DayStartHour      int    `toml:"day_start_hour"`
-	DayEndHour        int    `toml:"day_end_hour"`
-	MaxWindowZoom     int    `toml:"max_window_zoom"`     // Maximum zoom window in days
-	SuspendGapMinutes int    `toml:"suspend_gap_minutes"` // Consider gaps >= this as suspend/shutdown
+	IntervalSecs     int    `toml:"interval_secs"`
+	IntervalSecsOnAC int    `toml:"interval_secs_on_ac"`
+	Timezone         string `toml:"timezone"` // "UTC" or "Local"
+	LogDir           string `toml:"log_dir"`
+	LogFile          string `toml:"log_file"`
+	MaxLines         int    `toml:"max_lines"`
+	TrimBuffer       int    `toml:"trim_buffer"`
+	MaxChargePercent int    `toml:"max_charge_percent"`
+	DayColorNumber   int    `toml:"day_color_number"`
+	NightColorNumber int    `toml:"night_color_number"`
+	DayStartHour     int    `toml:"day_start_hour"`
+	DayEndHour       int    `toml:"day_end_hour"`
+	MaxWindowZoom    int    `toml:"max_window_zoom"` // Maximum zoom window in days
 }
 
 func Defaults() Config {
 	return Config{
-		IntervalSecs:      60,
-		IntervalSecsOnAC:  300,
-		Timezone:          "Local",
-		LogDir:            filepath.Join(xdgStateHome(), "battery-zen"),
-		LogFile:           "logs.csv",
-		MaxLines:          4000,
-		TrimBuffer:        100,
-		MaxChargePercent:  100,
-		DayColorNumber:    237, // Dark gray for day
-		NightColorNumber:  0,   // True black for night
-		DayStartHour:      7,   // 7 AM
-		DayEndHour:        19,  // 7 PM
-		MaxWindowZoom:     10,  // Maximum zoom window in days
-		SuspendGapMinutes: 5,   // Default 5 minutes gap detection
+		IntervalSecs:     60,
+		IntervalSecsOnAC: 300,
+		Timezone:         "Local",
+		LogDir:           defaultLogDir(),
+		LogFile:          "telemetry.csv",
+		MaxLines:         4000,
+		TrimBuffer:       100,
+		MaxChargePercent: 100,
+		DayColorNumber:   237, // Dark gray for day
+		NightColorNumber: 0,   // True black for night
+		DayStartHour:     7,   // 7 AM
+		DayEndHour:       19,  // 7 PM
+		MaxWindowZoom:    10,  // Maximum zoom window in days
 	}
 }
 
 // getConfigPathsInternal returns the list of config file paths that are checked
 func getConfigPathsInternal() []string {
-	return []string{
-		// Local project config
-		filepath.Join("internal", "config", "config.toml"),
-		// User config
-		filepath.Join(xdgConfigHome(), "battery-zen", "config.toml"),
-		// System config
-		"/etc/battery-zen/config.toml",
-	}
+	return platformConfigPaths()
 }
 
 // GetConfigPaths returns the list of config file paths that are checked, and which ones exist
@@ -178,8 +169,6 @@ func setConfigValue(key, value string, cfg *Config) error {
 		return parseIntValue(value, &cfg.DayEndHour)
 	case "max_window_zoom":
 		return parseIntValue(value, &cfg.MaxWindowZoom)
-	case "suspend_gap_minutes":
-		return parseIntValue(value, &cfg.SuspendGapMinutes)
 	}
 	return nil
 }
@@ -193,7 +182,7 @@ func parseIntValue(value string, target *int) error {
 	return nil
 }
 
-func XDGLogPath(cfg Config) (string, error) {
+func LogPath(cfg Config) (string, error) {
 	if _, err := os.Stat(cfg.LogDir); errors.Is(err, os.ErrNotExist) {
 		if err := os.MkdirAll(cfg.LogDir, 0o755); err != nil {
 			return "", err
@@ -207,20 +196,4 @@ func Now(cfg Config) time.Time {
 		return time.Now()
 	}
 	return time.Now().UTC()
-}
-
-func xdgConfigHome() string {
-	if v := os.Getenv("XDG_CONFIG_HOME"); v != "" {
-		return v
-	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".config")
-}
-
-func xdgStateHome() string {
-	if v := os.Getenv("XDG_STATE_HOME"); v != "" {
-		return v
-	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".local", "state")
 }
