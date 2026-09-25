@@ -3,6 +3,7 @@
 package lifecycle
 
 import (
+	"log"
 	"os"
 	"strings"
 	"sync"
@@ -15,6 +16,7 @@ const (
 	loginManagerInterface = "org.freedesktop.login1.Manager"
 	prepareForSleep       = loginManagerInterface + ".PrepareForSleep"
 	prepareForShutdown    = loginManagerInterface + ".PrepareForShutdown"
+	ackTimeout            = 2 * time.Second
 )
 
 type linuxMonitor struct {
@@ -22,6 +24,7 @@ type linuxMonitor struct {
 	events     chan Event
 	signals    chan *dbus.Signal
 	done       chan struct{}
+	inhibitor  *os.File
 	closeOnce  sync.Once
 	wait       sync.WaitGroup
 }
@@ -55,6 +58,7 @@ func Start() (Monitor, error) {
 		done:       make(chan struct{}),
 	}
 	connection.Signal(monitor.signals)
+	monitor.acquireInhibitor()
 	monitor.wait.Add(1)
 	go monitor.run()
 	return monitor, nil
@@ -71,6 +75,7 @@ func (monitor *linuxMonitor) Close() error {
 		monitor.connection.RemoveSignal(monitor.signals)
 		err = monitor.connection.Close()
 		monitor.wait.Wait()
+		monitor.releaseInhibitor()
 	})
 	return err
 }
@@ -110,12 +115,56 @@ func (monitor *linuxMonitor) run() {
 					kind = Shutdown
 				}
 			}
-			if kind != "" {
+			if kind == "" {
+				continue
+			}
+			if kind == Resume {
+				monitor.acquireInhibitor()
+				monitor.emit(Event{Kind: kind, Time: time.Now()})
+				continue
+			}
+			ack := make(chan struct{})
+			if monitor.emit(Event{Kind: kind, Time: time.Now(), Ack: ack}) {
 				select {
-				case monitor.events <- Event{Kind: kind, Time: time.Now()}:
-				default:
+				case <-ack:
+				case <-time.After(ackTimeout):
+				case <-monitor.done:
 				}
 			}
+			monitor.releaseInhibitor()
 		}
+	}
+}
+
+func (monitor *linuxMonitor) emit(event Event) bool {
+	select {
+	case monitor.events <- event:
+		return true
+	default:
+		return false
+	}
+}
+
+// A delay inhibitor makes logind wait until the event row is written before the user slice is frozen.
+func (monitor *linuxMonitor) acquireInhibitor() {
+	if monitor.inhibitor != nil {
+		return
+	}
+	var fd dbus.UnixFD
+	err := monitor.connection.Object("org.freedesktop.login1", "/org/freedesktop/login1").Call(
+		loginManagerInterface+".Inhibit", 0,
+		"sleep:shutdown", "Battery Zen", "Record battery state before sleep or shutdown", "delay",
+	).Store(&fd)
+	if err != nil {
+		log.Printf("lifecycle inhibitor: %v", err)
+		return
+	}
+	monitor.inhibitor = os.NewFile(uintptr(fd), "battery-zen-inhibitor")
+}
+
+func (monitor *linuxMonitor) releaseInhibitor() {
+	if monitor.inhibitor != nil {
+		monitor.inhibitor.Close()
+		monitor.inhibitor = nil
 	}
 }

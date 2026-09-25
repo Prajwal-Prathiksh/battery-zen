@@ -62,3 +62,13 @@ func BatteryCycleCount() (int, bool) {
 	}
 	return 0, false
 }
+
+// BatteryValue reads an integer attribute such as energy_now (µWh) or voltage_now (µV).
+func BatteryValue(name string) (int64, bool) {
+	if s, ok := readFirst("/sys/class/power_supply/BAT*/" + name); ok {
+		if v, err := strconv.ParseInt(s, 10, 64); err == nil {
+			return v, true
+		}
+	}
+	return 0, false
+}
